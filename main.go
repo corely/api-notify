@@ -7,6 +7,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+
+	"api-notify/database"
 )
 
 // NotifyRequest 定义了接收的请求结构
@@ -92,6 +94,18 @@ func sendMsgToEndpoint(url string, headers map[string][]string, body string, w h
 
 // main 函数启动 HTTP 服务
 func main() {
+	// 初始化数据库连接
+	err := database.InitDB("notify_db_user:notify_db_pass@tcp(127.0.0.1:3306)/notify_db?parseTime=true")
+	if err != nil {
+		log.Fatal("Failed to initialize database:", err)
+	}
+
+	// 创建message表
+	err = database.CreateMessageTable(database.DB)
+	if err != nil {
+		log.Fatal("Failed to create message table:", err)
+	}
+
 	http.HandleFunc("/notify", handler)
 	log.Println("Starting server on :8080")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
