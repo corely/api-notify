@@ -2,14 +2,19 @@ package main
 
 import (
 	"bytes"
-	"database/sql"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 
-	"./database"
+	"github.com/IBM/sarama"
 )
 
 // NotifyRequest 定义了接收的请求结构
@@ -27,8 +32,49 @@ type Endpoint struct {
 	Port int    `json:"port"`
 }
 
-// Handler 处理 /notify 接口的 HTTP POST 请求
-func handler(w http.ResponseWriter, r *http.Request) {
+// KafkaProducer Kafka生产者接口
+type KafkaProducer interface {
+	SendMessage(topic string, key string, value string) error
+	Close()
+}
+
+// SaramaProducer Sarama实现的Kafka生产者
+type SaramaProducer struct {
+	producer sarama.AsyncProducer
+}
+
+// SendMessage 发送消息到Kafka
+func (sp *SaramaProducer) SendMessage(topic string, key string, value string) error {
+	msg := &sarama.ProducerMessage{
+		Topic: topic,
+		Key:   sarama.StringEncoder(key),
+		Value: sarama.StringEncoder(value),
+	}
+	sp.producer.Input() <- msg
+	return nil
+}
+
+// Close 关闭生产者
+func (sp *SaramaProducer) Close() {
+	sp.producer.AsyncClose()
+}
+
+// NewKafkaProducer 创建新的Kafka生产者
+func NewKafkaProducer(brokers []string) (KafkaProducer, error) {
+	config := sarama.NewConfig()
+	config.Producer.RequiredAcks = sarama.WaitForAll
+	config.Producer.Retry.Max = 5
+	config.Producer.Return.Successes = true
+
+	producer, err := sarama.NewAsyncProducer(brokers, config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SaramaProducer{producer: producer}, nil
+}
+
+func handler(w http.ResponseWriter, r *http.Request, producer KafkaProducer) {
 	// 检查请求方法
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -51,36 +97,13 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 日志输出请求信息
-	log.Printf("Received notification: request_id=%s, partner_id=%s, endpoints=%v", req.RequestID, req.PartnerID, req.Endpoints)
+	log.Printf("Received notification: request_id=%s, partner_id=%s", req.RequestID, req.PartnerID)
 
-	// 创建数据库消息对象
-	msg := database.Message{
-		RequestID: req.RequestID,
-		PartnerID: req.PartnerID,
-		Endpoints: req.Endpoints,
-		Headers:   req.Headers,
-		Body:      req.Body,
-		Status:    "received",
-	}
-
-	// 存储消息到数据库
-	err = database.StoreMessage(msg)
+	// 发送消息到Kafka
+	err = producer.SendMessage("messages", req.RequestID, req.Body)
 	if err != nil {
-		// 如果是唯一键冲突错误，返回特定错误信息
-		if err.Error() == "消息已经接受，请不要重复发送" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusConflict)
-			fmt.Fprintf(w, `{"error": "%s"}`, err.Error())
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Failed to send message to Kafka", http.StatusInternalServerError)
 		return
-	}
-
-	// 发送消息到每个 endpoint
-	for _, ep := range req.Endpoints {
-		url := fmt.Sprintf("http://%s:%d/notify", ep.IP, ep.Port)
-		sendMsgToEndpoint(url, req.Headers, req.Body, w)
 	}
 
 	// 返回成功响应
@@ -92,7 +115,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 // sendMsgToEndpoint 向指定地址发送消息
 func sendMsgToEndpoint(url string, headers map[string][]string, body string, w http.ResponseWriter) {
 	client := &http.Client{}
-	req, err := http.NewRequest("POST", url, io.NopCloser(io.Reader(bytes.NewReader([]byte(body)))))
+	req, err := http.NewRequest("POST", url, io.NopCloser(bytes.NewReader([]byte(body))))
 	if err != nil {
 		log.Printf("Failed to create request for %s: %v", url, err)
 		return
@@ -114,26 +137,59 @@ func sendMsgToEndpoint(url string, headers map[string][]string, body string, w h
 
 	// 可选：读取响应内容
 	_, _ = io.Copy(io.Discard, resp.Body)
-	log.Printf("Sent to %s, status: %d", url, resp.StatusCode)
 }
 
 // main 函数启动 HTTP 服务
 func main() {
-	// 初始化数据库连接
-	err := database.InitDB("notify_db_user:notify_db_pass@tcp(127.0.0.1:3306)/notify_db?parseTime=true")
-	if err != nil {
-		log.Fatal("Failed to initialize database:", err)
+	// Kafka配置
+	kafkaBrokers := []string{"localhost:9092"} // 默认Kafka broker地址
+
+	// 从环境变量获取Kafka配置，如果没有则使用默认值
+	if kafkaBrokersEnv := os.Getenv("KAFKA_BROKERS"); kafkaBrokersEnv != "" {
+		kafkaBrokers = strings.Split(kafkaBrokersEnv, ",")
 	}
 
-	// 创建message表
-	err = database.CreateMessageTable(database.DB)
+	// 创建Kafka生产者
+	producer, err := NewKafkaProducer(kafkaBrokers)
 	if err != nil {
-		log.Fatal("Failed to create message table:", err)
+		log.Fatal("Failed to create Kafka producer:", err)
+	}
+	defer producer.Close()
+
+	// 创建HTTP服务器
+	server := &http.Server{
+		Addr: ":8080",
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handler(w, r, producer)
+		}),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 
-	http.HandleFunc("/notify", handler)
+	// 优雅关闭处理
+	done := make(chan bool)
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-quit
+		log.Println("Server is shutting down...")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := server.Shutdown(ctx); err != nil {
+			log.Fatal("Server forced to shutdown:", err)
+		}
+
+		close(done)
+	}()
+
 	log.Println("Starting server on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal("Server failed to start:", err)
 	}
+
+	<-done
+	log.Println("Server stopped")
 }
