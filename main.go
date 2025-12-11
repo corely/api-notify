@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"api-notify/database"
 	"github.com/IBM/sarama"
 )
 
@@ -74,6 +75,156 @@ func NewKafkaProducer(brokers []string) (KafkaProducer, error) {
 	return &SaramaProducer{producer: producer}, nil
 }
 
+// KafkaConsumer Kafka消费者接口
+type KafkaConsumer interface {
+	Consume() error
+	Close() error
+}
+
+// SaramaConsumer Sarama实现的Kafka消费者
+type SaramaConsumer struct {
+	consumer sarama.Consumer
+	topic    string
+	groupID  string
+}
+
+// NewKafkaConsumer 创建新的Kafka消费者
+func NewKafkaConsumer(brokers []string, topic string, groupID string) (KafkaConsumer, error) {
+	config := sarama.NewConfig()
+	config.Consumer.Return.Errors = true
+	config.Version = sarama.V2_0_0_0
+
+	consumer, err := sarama.NewConsumer(brokers, config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SaramaConsumer{
+		consumer: consumer,
+		topic:    topic,
+		groupID:  groupID,
+	}, nil
+}
+
+// Consume 开始消费消息
+func (sc *SaramaConsumer) Consume() error {
+	partitions, err := sc.consumer.Partitions(sc.topic)
+	if err != nil {
+		return err
+	}
+
+	for _, partition := range partitions {
+		pc, err := sc.consumer.ConsumePartition(sc.topic, partition, sarama.OffsetNewest)
+		if err != nil {
+			return err
+		}
+
+		go func(pc sarama.PartitionConsumer) {
+			for msg := range pc.Messages() {
+				log.Printf("Received message from Kafka: topic=%s, partition=%d, offset=%d, key=%s",
+					msg.Topic, msg.Partition, msg.Offset, string(msg.Key))
+
+				// 处理消息
+				err := processKafkaMessage(msg)
+				if err != nil {
+					log.Printf("Failed to process message: %v", err)
+				} else {
+					log.Printf("Message processed successfully: request_id=%s", string(msg.Key))
+				}
+			}
+		}(pc)
+	}
+
+	return nil
+}
+
+// Close 关闭消费者
+func (sc *SaramaConsumer) Close() error {
+	return sc.consumer.Close()
+}
+
+// processKafkaMessage 处理Kafka消息
+func processKafkaMessage(msg *sarama.ConsumerMessage) error {
+	// 解析消息内容为NotifyRequest结构体
+	var req NotifyRequest
+	err := json.Unmarshal(msg.Value, &req)
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal message: %v", err)
+	}
+
+	// 根据request_id查询数据库
+	exists, err := database.QueryMessageByRequestID(req.RequestID)
+	if err != nil {
+		return fmt.Errorf("failed to query database: %v", err)
+	}
+
+	if exists {
+		// 如果存在，则直接ack这条消息（在这个实现中，我们使用自动提交，所以不需要显式ack）
+		log.Printf("Message already exists in database: request_id=%s", req.RequestID)
+		return nil
+	}
+
+	// 否则，向合作方发送HTTP POST请求
+	for _, ep := range req.Endpoints {
+		url := fmt.Sprintf("http://%s:%d/notify", ep.IP, ep.Port)
+		err := sendHTTPRequest(url, req.Headers, req.Body)
+		if err != nil {
+			log.Printf("Failed to send request to %s: %v", url, err)
+			// 可以考虑是否继续发送到其他端点
+		} else {
+			log.Printf("Successfully sent request to %s", url)
+		}
+	}
+
+	// 将request_id写入数据库
+	msgDB := database.Message{
+		RequestID: req.RequestID,
+		PartnerID: req.PartnerID,
+		Endpoints: req.Endpoints,
+		Headers:   req.Headers,
+		Body:      req.Body,
+		Status:    "processed",
+	}
+
+	err = database.StoreMessage(msgDB)
+	if err != nil {
+		return fmt.Errorf("failed to store message in database: %v", err)
+	}
+
+	return nil
+}
+
+// sendHTTPRequest 发送HTTP请求到合作方
+func sendHTTPRequest(url string, headers map[string][]string, body string) error {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBufferString(body))
+	if err != nil {
+		return err
+	}
+
+	// 设置headers
+	for k, v := range headers {
+		for _, val := range v {
+			req.Header.Add(k, val)
+		}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("received non-2xx status code: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
 func handler(w http.ResponseWriter, r *http.Request, producer KafkaProducer) {
 	// 检查请求方法
 	if r.Method != http.MethodPost {
@@ -112,37 +263,27 @@ func handler(w http.ResponseWriter, r *http.Request, producer KafkaProducer) {
 	fmt.Fprintf(w, `{"status": "success", "request_id": "%s"}`, req.RequestID)
 }
 
-// sendMsgToEndpoint 向指定地址发送消息
-func sendMsgToEndpoint(url string, headers map[string][]string, body string, w http.ResponseWriter) {
-	client := &http.Client{}
-	req, err := http.NewRequest("POST", url, io.NopCloser(bytes.NewReader([]byte(body))))
-	if err != nil {
-		log.Printf("Failed to create request for %s: %v", url, err)
-		return
-	}
-
-	// 设置 headers
-	for k, v := range headers {
-		for _, val := range v {
-			req.Header.Add(k, val)
-		}
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("Failed to send message to %s: %v", url, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	// 可选：读取响应内容
-	_, _ = io.Copy(io.Discard, resp.Body)
-}
-
 // main 函数启动 HTTP 服务
 func main() {
+	// 数据库配置
+	dbDSN := "notify_db_user:notify_db_pass@tcp(127.0.0.1:3306)/notify_db?parseTime=true"
+
+	// 初始化数据库连接
+	err := database.InitDB(dbDSN)
+	if err != nil {
+		log.Fatal("Failed to initialize database:", err)
+	}
+
+	// 创建message表
+	err = database.CreateMessageTable(database.DB)
+	if err != nil {
+		log.Fatal("Failed to create message table:", err)
+	}
+
 	// Kafka配置
 	kafkaBrokers := []string{"localhost:9092"} // 默认Kafka broker地址
+	kafkaTopic := "messages"
+	kafkaGroupID := "api-notify-group"
 
 	// 从环境变量获取Kafka配置，如果没有则使用默认值
 	if kafkaBrokersEnv := os.Getenv("KAFKA_BROKERS"); kafkaBrokersEnv != "" {
@@ -155,6 +296,21 @@ func main() {
 		log.Fatal("Failed to create Kafka producer:", err)
 	}
 	defer producer.Close()
+
+	// 创建Kafka消费者
+	consumer, err := NewKafkaConsumer(kafkaBrokers, kafkaTopic, kafkaGroupID)
+	if err != nil {
+		log.Fatal("Failed to create Kafka consumer:", err)
+	}
+	defer consumer.Close()
+
+	// 启动消费者goroutine
+	go func() {
+		log.Println("Starting Kafka consumer...")
+		if err := consumer.Consume(); err != nil {
+			log.Fatal("Kafka consumer error:", err)
+		}
+	}()
 
 	// 创建HTTP服务器
 	server := &http.Server{

@@ -85,3 +85,13 @@ func StoreMessage(msg Message) error {
 func isDuplicateKeyError(err error) bool {
 	return err.Error() == "Error 1062: Duplicate entry"
 }
+
+// QueryMessageByRequestID 根据request_id查询消息是否存在
+func QueryMessageByRequestID(requestID string) (bool, error) {
+	var count int
+	err := DB.QueryRow("SELECT COUNT(*) FROM message WHERE request_id = ?", requestID).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("failed to query message: %v", err)
+	}
+	return count > 0, nil
+}
