@@ -2,6 +2,7 @@ package database
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 
@@ -10,6 +11,22 @@ import (
 
 // DB 数据库连接全局变量
 var DB *sql.DB
+
+// Message 定义消息表结构
+type Message struct {
+	RequestID string              `json:"request_id"`
+	PartnerID string              `json:"partner_id"`
+	Endpoints []Endpoint          `json:"endpoints"`
+	Headers   map[string][]string `json:"headers"`
+	Body      string              `json:"body"`
+	Status    string              `json:"status"`
+}
+
+// Endpoint 表示一个对外合作方的连接参数
+type Endpoint struct {
+	IP   string `json:"ip"`
+	Port int    `json:"port"`
+}
 
 // InitDB 初始化数据库连接
 func InitDB(dataSourceName string) error {
@@ -26,4 +43,45 @@ func InitDB(dataSourceName string) error {
 	DB = db
 	log.Println("Database connected successfully")
 	return nil
+}
+
+// StoreMessage 存储消息到数据库
+func StoreMessage(msg Message) error {
+	// 将headers转换为JSON字符串存储
+	headersJSON, err := json.Marshal(msg.Headers)
+	if err != nil {
+		return fmt.Errorf("failed to marshal headers: %v", err)
+	}
+
+	// 将endpoints转换为JSON字符串存储
+	endpointsJSON, err := json.Marshal(msg.Endpoints)
+	if err != nil {
+		return fmt.Errorf("failed to marshal endpoints: %v", err)
+	}
+
+	// 执行插入操作
+	_, err = DB.Exec(`
+		INSERT INTO message(request_id, partner_id, endpoints, headers, body, status)
+		VALUES(?, ?, ?, ?, ?, ?)`,
+		msg.RequestID,
+		msg.PartnerID,
+		string(endpointsJSON),
+		string(headersJSON),
+		msg.Body,
+		msg.Status)
+
+	if err != nil {
+		// 检查是否是唯一键冲突错误
+		if isDuplicateKeyError(err) {
+			return fmt.Errorf("消息已经接受，请不要重复发送")
+		}
+		return fmt.Errorf("failed to store message: %v", err)
+	}
+
+	return nil
+}
+
+// isDuplicateKeyError 检查是否是唯一键冲突错误
+func isDuplicateKeyError(err error) bool {
+	return err.Error() == "Error 1062: Duplicate entry"
 }

@@ -2,13 +2,14 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 
-	"api-notify/database"
+	"./database"
 )
 
 // NotifyRequest 定义了接收的请求结构
@@ -51,6 +52,30 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	// 日志输出请求信息
 	log.Printf("Received notification: request_id=%s, partner_id=%s, endpoints=%v", req.RequestID, req.PartnerID, req.Endpoints)
+
+	// 创建数据库消息对象
+	msg := database.Message{
+		RequestID: req.RequestID,
+		PartnerID: req.PartnerID,
+		Endpoints: req.Endpoints,
+		Headers:   req.Headers,
+		Body:      req.Body,
+		Status:    "received",
+	}
+
+	// 存储消息到数据库
+	err = database.StoreMessage(msg)
+	if err != nil {
+		// 如果是唯一键冲突错误，返回特定错误信息
+		if err.Error() == "消息已经接受，请不要重复发送" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			fmt.Fprintf(w, `{"error": "%s"}`, err.Error())
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	// 发送消息到每个 endpoint
 	for _, ep := range req.Endpoints {
