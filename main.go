@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"api-notify/database"
+
 	"github.com/IBM/sarama"
 )
 
@@ -171,16 +172,21 @@ func processKafkaMessage(msg *sarama.ConsumerMessage) error {
 		if err != nil {
 			log.Printf("Failed to send request to %s: %v", url, err)
 			// 可以考虑是否继续发送到其他端点
+			continue
 		} else {
 			log.Printf("Successfully sent request to %s", url)
 		}
 	}
 
+	eps := make([]database.Endpoint, len(req.Endpoints))
+	for i, ep := range req.Endpoints {
+		eps[i] = database.Endpoint{IP: ep.IP, Port: ep.Port}
+	}
 	// 将request_id写入数据库
 	msgDB := database.Message{
 		RequestID: req.RequestID,
 		PartnerID: req.PartnerID,
-		Endpoints: req.Endpoints,
+		Endpoints: eps,
 		Headers:   req.Headers,
 		Body:      req.Body,
 		Status:    "processed",
@@ -274,11 +280,12 @@ func main() {
 		log.Fatal("Failed to initialize database:", err)
 	}
 
+	// 假定表已经存在
 	// 创建message表
-	err = database.CreateMessageTable(database.DB)
-	if err != nil {
-		log.Fatal("Failed to create message table:", err)
-	}
+	//err = database.CreateMessageTable(database.DB)
+	//if err != nil {
+	//	log.Fatal("Failed to create message table:", err)
+	//}
 
 	// Kafka配置
 	kafkaBrokers := []string{"localhost:9092"} // 默认Kafka broker地址
